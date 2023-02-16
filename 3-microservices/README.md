@@ -38,14 +38,15 @@ Once we have verified this new microservice works we can remove the old code pat
 
    ```
    $ aws cloudformation deploy \
-   --template-file infrastructure/ecs.yml \
-   --region <region> \
-   --stack-name <stack name> \
-   --capabilities CAPABILITY_NAMED_IAM
+   --template-file infrastructure/ecs-fargate.yml \
+   --region eu-west-3 \
+   --stack-name ecs-fargate-mode-DEV \
+   --capabilities CAPABILITY_NAMED_IAM \
+   --profile personal
    ```
 
 2. Deploy the services onto your cluster: 
 
    ```
-   $ ./deploy.sh <region> <stack name>
+   ./deploy.sh eu-west-3 ecs-fargate-mode-DEV personal <AWS_ACCOUNT>
    ```

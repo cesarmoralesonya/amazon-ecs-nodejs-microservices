@@ -30,6 +30,6 @@ router.get('/', function *() {
 app.use(router.routes());
 app.use(router.allowedMethods());
 
-app.listen(3000);
+app.listen(80);
 
 console.log('Worker started');

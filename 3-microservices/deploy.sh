@@ -1,5 +1,7 @@
 REGION=$1
 STACK_NAME=$2
+PROFILE=$3
+AWS_ACCOUNT=$4
 
 DEPLOYABLE_SERVICES=(
 	users
@@ -19,7 +21,10 @@ QUERY=$(cat <<-EOF
 	Stacks[0].Outputs[?OutputKey==\`ALBArn\`].OutputValue,
 	Stacks[0].Outputs[?OutputKey==\`ECSRole\`].OutputValue,
 	Stacks[0].Outputs[?OutputKey==\`Url\`].OutputValue,
-	Stacks[0].Outputs[?OutputKey==\`VPCId\`].OutputValue
+	Stacks[0].Outputs[?OutputKey==\`VPCId\`].OutputValue,
+	Stacks[0].Outputs[?OutputKey==\`PublicSubnetOneId\`].OutputValue,
+	Stacks[0].Outputs[?OutputKey==\`PublicSubnetTwoId\`].OutputValue,
+	Stacks[0].Outputs[?OutputKey==\`EcsSecurityGroupId\`].OutputValue
 ]
 EOF)
 
@@ -27,7 +32,8 @@ RESULTS=$(aws cloudformation describe-stacks \
 	--stack-name $STACK_NAME \
 	--region $REGION \
 	--query "$QUERY" \
-	--output text);
+	--output text \
+	--profile $PROFILE);
 RESULTS_ARRAY=($RESULTS)
 
 CLUSTER_NAME=${RESULTS_ARRAY[0]}
@@ -35,10 +41,19 @@ ALB_ARN=${RESULTS_ARRAY[1]}
 ECS_ROLE=${RESULTS_ARRAY[2]}
 URL=${RESULTS_ARRAY[3]}
 VPCID=${RESULTS_ARRAY[4]}
+PUBLICSUBNETONEID=${RESULTS_ARRAY[5]}
+PUBLICSUBNETTWOID=${RESULTS_ARRAY[6]}
+ECSSECURITYGROUPID=${RESULTS_ARRAY[7]}
+
+printf "DEPLOY IN CLUSTER: ${CLUSTER_NAME}\n";
+printf "DEPLOY IN SUBNETONE: ${PUBLICSUBNETONEID}\n";
+printf "DEPLOY IN SUBNETTWO: ${PUBLICSUBNETTWOID}\n";
+printf "DEPLOY IN SECURITYGROUP: ${ECSSECURITYGROUPID}\n";
+printf "DEPLOY IN ECS_ROLE: ${ECS_ROLE}\n";
 
 printf "${PRIMARY}* Authenticating with EC2 Container Repository${NC}\n";
 
-`aws ecr get-login --region $REGION --no-include-email`
+aws ecr get-login-password --region $REGION --profile $PROFILE | docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
 
 # Tag for versioning the container images, currently set to timestamp
 TAG=`date +%s`
@@ -52,7 +67,8 @@ do
 		--region $REGION \
 		--repository-names "$SERVICE_NAME" \
 		--query "repositories[0].repositoryUri" \
-		--output text`
+		--output text \
+		--profile $PROFILE` 
 
 	if [ "$?" != "0" ]; then
 		# The repository was not found, create it
@@ -62,7 +78,8 @@ do
 			--region $REGION \
 			--repository-name "$SERVICE_NAME" \
 			--query "repository.repositoryUri" \
-			--output text`
+			--output text \
+			--profile $PROFILE`
 	fi
 
 	printf "${PRIMARY}* Building \`${SERVICE_NAME}\`${NC}\n";
@@ -87,19 +104,25 @@ do
 			"cpu": 256,
 			"memory": 256,
 			"portMappings": [{
-				"containerPort": 3000,
-				"hostPort": 0
+				"containerPort": 80,
+				"hostPort": 80
 			}],
 			"essential": true
 		}]
 	EOF)
 
 	TASK_DEFINITION_ARN=`aws ecs register-task-definition \
+		--execution-role-arn $ECS_ROLE \
 		--region $REGION \
 		--family $SERVICE_NAME \
 		--container-definitions "$CONTAINER_DEFINITIONS" \
+		--network-mode awsvpc \
 		--query "taskDefinition.taskDefinitionArn" \
-		--output text`
+		--requires-compatibilities FARGATE \
+		--cpu 256 \
+		--memory 512 \
+		--output text \
+		--profile $PROFILE`
 
 	# Ensure that the service exists in ECS
 	STATUS=`aws ecs describe-services \
@@ -107,7 +130,8 @@ do
 		--cluster $CLUSTER_NAME \
 		--services $SERVICE_NAME \
 		--query "services[0].status" \
-		--output text`
+		--output text \
+		--profile $PROFILE`
 
 	if [ "$STATUS" != "ACTIVE" ]; then
 		# New service that needs to be deployed because it hasn't
@@ -123,6 +147,7 @@ do
 				--region $REGION \
 				--name $SERVICE_NAME \
 				--vpc-id $VPCID \
+				--target-type ip \
 				--port 80 \
 				--protocol HTTP \
 				--health-check-protocol HTTP \
@@ -132,7 +157,9 @@ do
 				--healthy-threshold-count 2 \
 				--unhealthy-threshold-count 2 \
 				--query "TargetGroups[0].TargetGroupArn" \
-				--output text`
+				--matcher HttpCode=200 \
+				--output text \
+				--profile $PROFILE`
 
 			printf "${PRIMARY}* Locating load balancer listener \`${SERVICE_NAME}\`${NC}\n";
 
@@ -140,7 +167,8 @@ do
 				--region $REGION \
 				--load-balancer-arn $ALB_ARN \
 				--query "Listeners[0].ListenerArn" \
-				--output text`
+				--output text \
+				--profile $PROFILE`
 
 			if [ "$LISTENER_ARN" == "None" ]; then
 				printf "${PRIMARY}* Creating listener for load balancer${NC}\n";
@@ -152,7 +180,8 @@ do
 					--protocol HTTP \
 					--query "Listeners[0].ListenerArn" \
 					--default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN \
-					--output text`
+					--output text \
+					--profile $PROFILE`
 			fi
 
 			printf "${PRIMARY}* Adding rule to load balancer listener \`${SERVICE_NAME}\`${NC}\n";
@@ -160,10 +189,17 @@ do
 			# Manipulate the template to customize it with the target group and listener
 			RULE_DOC=`cat ./services/$SERVICE_NAME/rule.json |
 								jq ".ListenerArn=\"$LISTENER_ARN\" | .Actions[0].TargetGroupArn=\"$TARGET_GROUP_ARN\""`
-
-			aws elbv2 create-rule \
+			
+			printf "$RULE_DOC \n";
+			
+			RULE=`aws elbv2 create-rule \
 				--region $REGION \
-				--cli-input-json "$RULE_DOC"
+				--cli-input-json "$RULE_DOC" \
+				--profile $PROFILE`
+			
+			printf "${PRIMARY}* Rule created for service \`${SERVICE_NAME}\`${NC}:\n";
+
+			printf "$RULE\n";
 
 			printf "${PRIMARY}* Creating new web facing service \`${SERVICE_NAME}\`${NC}\n";
 
@@ -171,18 +207,24 @@ do
 				[{
 					"targetGroupArn": "$TARGET_GROUP_ARN",
 					"containerName": "$SERVICE_NAME",
-					"containerPort": 3000
+					"containerPort": 80
 				}]
 			EOF)
+
+			printf "$LOAD_BALANCERS\n"
 
 			RESULT=`aws ecs create-service \
 				--region $REGION \
 				--cluster $CLUSTER_NAME \
 				--load-balancers "$LOAD_BALANCERS" \
 				--service-name $SERVICE_NAME \
-				--role $ECS_ROLE \
 				--task-definition $TASK_DEFINITION_ARN \
-				--desired-count 1`
+				--launch-type FARGATE \
+				--desired-count 1 \
+				--network-configuration "awsvpcConfiguration={subnets=[$PUBLICSUBNETONEID, $PUBLICSUBNETTWOID],securityGroups=[$ECSSECURITYGROUPID], assignPublicIp=ENABLED}" \
+				--profile $PROFILE`
+			
+			printf "$RESULT\n"
 		else
 			# This service doesn't have a web interface, just create it without load balancer settings
 			printf "${PRIMARY}* Creating new background service \`${SERVICE_NAME}\`${NC}\n";
@@ -191,7 +233,8 @@ do
 				--cluster $CLUSTER_NAME \
 				--service-name $SERVICE_NAME \
 				--task-definition $TASK_DEFINITION_ARN \
-				--desired-count 1`
+				--desired-count 1 \
+				--profile $PROFILE`
 		fi
 	else
 		# The service already existed, just update the existing service.
@@ -200,7 +243,8 @@ do
 			--region $REGION \
 			--cluster $CLUSTER_NAME \
 			--service $SERVICE_NAME \
-			--task-definition $TASK_DEFINITION_ARN`
+			--task-definition $TASK_DEFINITION_ARN \
+			--profile $PROFILE`
 	fi
 done
 
